@@ -1,0 +1,244 @@
+# Coordinator (coordinator.py)
+"""
+Coordinator for coordinated checkpointing simulation.
+Usage: python3 coordinator.py <port> <expected_nodes>
+"""
+import socket
+import threading
+import queue
+import sys
+import time
+
+clients = []  # list of (conn, addr, id, inbox_queue)
+clients_lock = threading.Lock()
+
+
+def client_listener(conn, addr, inbox):
+    try:
+        with conn:
+            f = conn.makefile('r')
+            while True:
+                line = f.readline()
+                if not line:
+                    break
+                line = line.strip()
+                inbox.put(line)
+    except Exception as e:
+        print(f"Client {addr} listener stopped: {e}")
+
+
+def accept_connections(server_sock, expected):
+    print(f"Coordinator listening on {server_sock.getsockname()}. Waiting for {expected} nodes...")
+    while True:
+        conn, addr = server_sock.accept()
+        inbox = queue.Queue()
+        # assign temporary id (will be from node message if needed)
+        with clients_lock:
+            clients.append({'conn': conn, 'addr': addr, 'id': None, 'inbox': inbox})
+        threading.Thread(target=client_listener, args=(conn, addr, inbox), daemon=True).start()
+        print(f"Node connected: {addr}")
+        with clients_lock:
+            if len(clients) >= expected:
+                break
+
+
+def send_all(msg):
+    with clients_lock:
+        for c in clients:
+            try:
+                c['conn'].sendall((msg + '\n').encode())
+            except Exception as e:
+                print(f"Failed to send to {c['addr']}: {e}")
+
+
+def coordinated_checkpoint(timeout_ms=5000):
+    print("Starting coordinated checkpoint round...")
+    send_all("CHECKPOINT_REQUEST")
+
+    deadline = time.time() + timeout_ms / 1000.0
+    acks = set()
+    while time.time() < deadline and len(acks) < len(clients):
+        with clients_lock:
+            for c in clients:
+                try:
+                    while not c['inbox'].empty():
+                        m = c['inbox'].get_nowait()
+                        if m.startswith('CHECKPOINT_ACK'):
+                            # message format: CHECKPOINT_ACK <nodeid>
+                            parts = m.split()
+                            nid = parts[1] if len(parts) > 1 else str(c['addr'])
+                            acks.add(nid)
+                            print(f"ACK from {nid}")
+                except queue.Empty:
+                    pass
+        time.sleep(0.05)
+
+    if len(acks) == len(clients):
+        print("All nodes acknowledged. Sending COMMIT.")
+        send_all("COMMIT")
+    else:
+        print(f"Timeout or missing ACKs ({len(acks)}/{len(clients)}). Sending ABORT.")
+        send_all("ABORT")
+
+
+if __name__ == '__main__':
+    if len(sys.argv) < 3:
+        print("Usage: python3 coordinator.py <port> <expected_nodes>")
+        sys.exit(1)
+
+    port = int(sys.argv[1])
+    expected = int(sys.argv[2])
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(('0.0.0.0', port))
+    server.listen()
+
+    accept_connections(server, expected)
+
+    try:
+        while True:
+            cmd = input("Enter command (checkpoint / exit): ").strip()
+            if cmd == 'checkpoint':
+                coordinated_checkpoint()
+            elif cmd == 'exit':
+                break
+            else:
+                print("Unknown command")
+    except KeyboardInterrupt:
+        pass
+
+    server.close()
+
+
+# Node (node.py)
+"""
+Node for coordinated checkpoint simulation.
+Usage: python3 node.py <nodeid> <host> <port>
+"""
+import socket
+import threading
+import sys
+import time
+import random
+import os
+
+
+class Node:
+    def __init__(self, nodeid, host, port):
+        self.nodeid = nodeid
+        self.host = host
+        self.port = port
+        self.sock = None
+        self.local_counter = 0
+        self.running = True
+
+    def connect(self):
+        self.sock = socket.create_connection((self.host, int(self.port)))
+        # send an intro so coordinator can know id if needed
+        self.sock.sendall((f"NODE_ID {self.nodeid}\n").encode())
+        print(f"{self.nodeid} connected to {self.host}:{self.port}")
+
+    def listen(self):
+        f = self.sock.makefile('r')
+        try:
+            while self.running:
+                line = f.readline()
+                if not line:
+                    break
+                line = line.strip()
+                print(f"Coordinator-> {line}")
+                if line == 'CHECKPOINT_REQUEST':
+                    ok = self.take_checkpoint()
+                    if ok:
+                        self.sock.sendall((f"CHECKPOINT_ACK {self.nodeid}\n").encode())
+                    else:
+                        self.sock.sendall((f"CHECKPOINT_NACK {self.nodeid}\n").encode())
+                elif line == 'COMMIT':
+                    print(f"{self.nodeid} commit confirmed")
+                elif line == 'ABORT':
+                    print(f"{self.nodeid} abort received")
+        except Exception as e:
+            print(f"Listener stopped: {e}")
+
+    def take_checkpoint(self):
+        try:
+            os.makedirs('checkpoints', exist_ok=True)
+            fn = os.path.join('checkpoints', f'ckpt_{self.nodeid}.txt')
+            with open(fn, 'w') as f:
+                f.write(f"node={self.nodeid}\n")
+                f.write(f"timestamp={time.time()}\n")
+                f.write(f"localCounter={self.local_counter}\n")
+            print(f"{self.nodeid} saved checkpoint (localCounter={self.local_counter})")
+            return True
+        except Exception as e:
+            print(f"Checkpoint failed: {e}")
+            return False
+
+    def recover(self):
+        fn = os.path.join('checkpoints', f'ckpt_{self.nodeid}.txt')
+        if not os.path.exists(fn):
+            print("No checkpoint found")
+            return
+        with open(fn) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('localCounter='):
+                    self.local_counter = int(line.split('=')[1])
+        print(f"{self.nodeid} recovered localCounter={self.local_counter}")
+
+    def run(self):
+        self.connect()
+        t = threading.Thread(target=self.listen, daemon=True)
+        t.start()
+
+        try:
+            while True:
+                time.sleep(2)
+                self.local_counter += random.randint(0, 4)
+                print(f"{self.nodeid} localCounter={self.local_counter}")
+                # simple console commands support
+                # if stdin has data, read it (works if run in terminal)
+                try:
+                    if os.name == 'posix':
+                        import select
+                        if select.select([sys.stdin], [], [], 0)[0]:
+                            cmd = sys.stdin.readline().strip()
+                            if cmd == 'fail':
+                                print(f"{self.nodeid} simulating crash...")
+                                os._exit(1)
+                            elif cmd == 'recover':
+                                self.recover()
+                    else:
+                        # on Windows, just ignore interactive commands in this loop
+                        pass
+                except Exception:
+                    pass
+        except KeyboardInterrupt:
+            pass
+
+
+if __name__ == '__main__':
+    if len(sys.argv) < 4:
+        print("Usage: python3 node.py <nodeid> <host> <port>")
+        sys.exit(1)
+    n = Node(sys.argv[1], sys.argv[2], sys.argv[3])
+    n.run()
+
+
+# README
+"""
+How to run:
+1) Start coordinator (example, port 9000, expecting 2 nodes):
+   python3 coordinator.py 9000 2
+
+2) In two other terminals start nodes:
+   python3 node.py node1 localhost 9000
+   python3 node.py node2 localhost 9000
+
+3) In coordinator console type 'checkpoint' and press Enter to initiate a checkpoint round.
+4) To simulate crash in a node terminal type 'fail' and restart node, then type 'recover' to load last checkpoint.
+
+Notes:
+- This is a teaching simulation. For production / robustness add heartbeats, reconnection logic, persistent storage, and better failure detection.
+"""
