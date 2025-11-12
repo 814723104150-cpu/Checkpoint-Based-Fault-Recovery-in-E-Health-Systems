@@ -226,19 +226,3 @@ if __name__ == '__main__':
     n.run()
 
 
-# README
-"""
-How to run:
-1) Start coordinator (example, port 9000, expecting 2 nodes):
-   python3 coordinator.py 9000 2
-
-2) In two other terminals start nodes:
-   python3 node.py node1 localhost 9000
-   python3 node.py node2 localhost 9000
-
-3) In coordinator console type 'checkpoint' and press Enter to initiate a checkpoint round.
-4) To simulate crash in a node terminal type 'fail' and restart node, then type 'recover' to load last checkpoint.
-
-Notes:
-- This is a teaching simulation. For production / robustness add heartbeats, reconnection logic, persistent storage, and better failure detection.
-"""
